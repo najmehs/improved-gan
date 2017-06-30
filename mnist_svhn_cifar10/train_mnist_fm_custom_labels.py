@@ -1,202 +1,262 @@
-#! /usr/bin/env python
-"""
-This is a modified version of train_mnist_feature_matching.py.
 
-It trains on a custom set of labels.
-
-The use case motivating this setup is differentially private learning with
-noisy labels: https://github.com/tensorflow/models/tree/master/privacy
-
-This version of the script uses a subset of the first 8,000 examples in the
-MNIST test set for training, and uses the remaining examples as a test set.
-This is because the model that provides the privatized noisy labels was
-trained on the original MNIST training set.
-
-Of the 8,000 examples available for training, the `count`, `balance`, and
-`seed_data` arguments determine which will be used.
-The `perm.npy` and `used_inds_%(count)d.npy` files specify exactly which
-examples were used, so that the algorithm can be analyzed for its privacy
-properties.
-"""
-import sys
-import argparse
+"""GAN that learns to generate samples from N(5,1) given N(0,1) noise"""
 import numpy as np
+# import plotly.graph_objs as go
+# import plotly.offline as py
 import os
-import theano as th
+from keras.layers.advanced_activations import LeakyReLU
+from keras.layers import Dense, Input, concatenate, SimpleRNN
+from keras.layers import Convolution1D
+from keras.models import Model
+from keras.optimizers import Adam
+
+from keras.layers import Input, LSTM, Dense, merge
+from keras.models import Model, Sequential
+from keras.layers import TimeDistributed, Dropout, Activation, Masking, Reshape, Flatten, Lambda, RepeatVector
+from keras.layers.wrappers import Bidirectional
+from keras.optimizers import RMSprop, SGD, Adam, Adadelta
 import theano.tensor as T
-import lasagne
-import lasagne.layers as LL
-import time
-import nn
-from theano.sandbox.rng_mrg import MRG_RandomStreams
-
-# settings
-parser = argparse.ArgumentParser()
-parser.add_argument('--seed', type=int, default=1)
-parser.add_argument('--seed_data', type=int, default=1)
-parser.add_argument('--unlabeled_weight', type=float, default=1.)
-parser.add_argument('--batch_size', type=int, default=100)
-parser.add_argument('--count', type=int, default=10) # this is the number of labeled examples per class
-parser.add_argument('--balance', type=str, default="True")
-parser.add_argument('--labels', type=str)
-parser.add_argument('--epochs', type=int, default=300)
-args = parser.parse_args()
-args.balance = eval(args.balance)
-print(args)
+from keras.callbacks import EarlyStopping
+from keras.constraints import maxnorm
+from EarlyStoppingPerTask import *
+from keras.objectives import mse
+from keras.activations import relu
+from keras.utils.vis_utils import plot_model
+from keras.losses import categorical_crossentropy, binary_crossentropy
+from keras.metrics import categorical_accuracy, binary_accuracy
+generator = ''
+discriminiator =''
+batchsize =''
+gan =''
 
 
-# fixed random seeds
-rng = np.random.RandomState(args.seed)
-theano_rng = MRG_RandomStreams(rng.randint(2 ** 15))
-lasagne.random.set_rng(np.random.RandomState(rng.randint(2 ** 15)))
-data_rng = np.random.RandomState(args.seed_data)
+def my_relu(x, alpha=0.0, max_value=1.0):
+    return relu(x, alpha=alpha, max_value=max_value)
 
-# specify generative model
-noise = theano_rng.uniform(size=(args.batch_size, 100))
-gen_layers = [LL.InputLayer(shape=(args.batch_size, 100), input_var=noise)]
-gen_layers.append(nn.batch_norm(LL.DenseLayer(gen_layers[-1], num_units=500, nonlinearity=T.nnet.softplus), g=None))
-gen_layers.append(nn.batch_norm(LL.DenseLayer(gen_layers[-1], num_units=500, nonlinearity=T.nnet.softplus), g=None))
-gen_layers.append(nn.l2normalize(LL.DenseLayer(gen_layers[-1], num_units=28**2, nonlinearity=T.nnet.sigmoid)))
-gen_dat = LL.get_output(gen_layers[-1], deterministic=False)
 
-# specify supervised model
-layers = [LL.InputLayer(shape=(None, 28**2))]
-layers.append(nn.GaussianNoiseLayer(layers[-1], sigma=0.3))
-layers.append(nn.DenseLayer(layers[-1], num_units=1000))
-layers.append(nn.GaussianNoiseLayer(layers[-1], sigma=0.5))
-layers.append(nn.DenseLayer(layers[-1], num_units=500))
-layers.append(nn.GaussianNoiseLayer(layers[-1], sigma=0.5))
-layers.append(nn.DenseLayer(layers[-1], num_units=250))
-layers.append(nn.GaussianNoiseLayer(layers[-1], sigma=0.5))
-layers.append(nn.DenseLayer(layers[-1], num_units=250))
-layers.append(nn.GaussianNoiseLayer(layers[-1], sigma=0.5))
-layers.append(nn.DenseLayer(layers[-1], num_units=250))
-layers.append(nn.GaussianNoiseLayer(layers[-1], sigma=0.5))
-layers.append(nn.DenseLayer(layers[-1], num_units=10, nonlinearity=None, train_scale=True))
+def cc_coef(y_true, y_pred):
+    mu_y_true = T.mean(y_true, axis=-1, keepdims=True)
+    mu_y_pred = T.mean(y_pred, axis=-1, keepdims=True)
+    var_pred = T.mean((y_pred - mu_y_pred) * (y_pred - mu_y_pred), axis=-1)
+    var_true = T.mean((y_true - mu_y_true) * (y_true - mu_y_true), axis=-1)
+    return 1 - 2 * T.mean((y_true - mu_y_true) * (y_pred - mu_y_pred), axis=-1) / (
+        var_pred + var_true + T.mean(T.square(mu_y_pred - mu_y_true), axis=-1))
 
-# costs
-labels = T.ivector()
-x_lab = T.matrix()
-x_unl = T.matrix()
 
-temp = LL.get_output(gen_layers[-1], init=True)
-temp = LL.get_output(layers[-1], x_lab, deterministic=False, init=True)
-init_updates = [u for l in gen_layers+layers for u in getattr(l,'init_updates',[])]
+def cc_coef_mean(y_true, y_pred):
+    mu_y_true = T.mean(y_true, axis=-1, keepdims=True)
+    mu_y_pred = T.mean(y_pred, axis=-1, keepdims=True)
+    cc = 1 - T.mean(2 * T.mean((y_true - mu_y_true) * (y_pred - mu_y_pred), axis=-1) / (
+    T.var(y_true, axis=-1) + T.var(y_pred, axis=-1) + T.mean(T.square(mu_y_pred - mu_y_true), axis=-1)))
+    return T.switch(T.isnan(cc), 0, cc)
 
-output_before_softmax_lab = LL.get_output(layers[-1], x_lab, deterministic=False)
-output_before_softmax_unl = LL.get_output(layers[-1], x_unl, deterministic=False)
-output_before_softmax_fake = LL.get_output(layers[-1], gen_dat, deterministic=False)
 
-z_exp_lab = T.mean(nn.log_sum_exp(output_before_softmax_lab))
-z_exp_unl = T.mean(nn.log_sum_exp(output_before_softmax_unl))
-z_exp_fake = T.mean(nn.log_sum_exp(output_before_softmax_fake))
-l_lab = output_before_softmax_lab[T.arange(args.batch_size),labels]
-l_unl = nn.log_sum_exp(output_before_softmax_unl)
-loss_lab = -T.mean(l_lab) + T.mean(z_exp_lab)
-loss_unl = -0.5*T.mean(l_unl) + 0.5*T.mean(T.nnet.softplus(nn.log_sum_exp(output_before_softmax_unl))) + 0.5*T.mean(T.nnet.softplus(nn.log_sum_exp(output_before_softmax_fake)))
+def build_model_irnn_face(max_frames_x, input_dim, output_dim, nb_units, test_cond=0):
+    if test_cond == 1:
+        input_seqs = Input(shape=(None, input_dim), dtype='float32', name='input_s')
+        input_seqs_rnd = Input(shape=(None, 1), dtype='float32', name='input_s_rnd')
+    else:
+        input_seqs = Input(shape=(max_frames_x, input_dim), dtype='float32', name='input_s')
+        input_seqs_rnd = Input(shape=(max_frames_x, 1), dtype='float32', name='input_s_rnd')
 
-train_err = T.mean(T.neq(T.argmax(output_before_softmax_lab,axis=1),labels))
+    input_seqs_merged = concatenate([input_seqs, input_seqs_rnd])
+    # msk_inp = Masking(mask_value=0.0)(input_seqs)
+    layer_id = 0
+    outs = {}
+    outs['layer' + str(layer_id) + '_out'] = Bidirectional(SimpleRNN(nb_units[layer_id], activation='relu',
+                                                       use_bias=True, recurrent_initializer='orthogonal',
+                                                       bias_initializer='zeros',
+                                                       dropout=0.2, recurrent_dropout=0.2,
+                                                       kernel_regularizer=None, recurrent_regularizer=None,
+                                                       bias_regularizer=None, activity_regularizer=None,
+                                                       kernel_constraint=None, recurrent_constraint=None,
+                                                       bias_constraint=None, return_sequences=True))(input_seqs_merged)
+    layer_id += 1
+    while layer_id < len(nb_units):
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(SimpleRNN(nb_units[layer_id], activation='relu',
+                                                           use_bias=True, recurrent_initializer='orthogonal',
+                                                           bias_initializer='zeros', dropout=0.2,
+                                                           recurrent_dropout=0.2, kernel_regularizer=None,
+                                                           recurrent_regularizer=None, bias_regularizer=None,
+                                                           activity_regularizer=None, kernel_constraint=None,
+                                                           recurrent_constraint=None, bias_constraint=None,
+                                                           return_sequences=True))\
+            (outs['layer' + str(layer_id - 1) + '_out'])
+        layer_id += 1
+    outs_drp = Dropout(rate=0.2)(outs['layer' + str(layer_id - 1) + '_out'])
+    output = TimeDistributed(Dense(output_dim * 1,),
+                             batch_input_shape=(max_frames_x, nb_units[-1]),
+                             name='output')(outs_drp)
+    model = Model(inputs=[input_seqs, input_seqs_rnd], outputs=[output])
+    return model
 
-mom_gen = T.mean(LL.get_output(layers[-3], gen_dat), axis=0)
-mom_real = T.mean(LL.get_output(layers[-3], x_unl), axis=0)
-loss_gen = T.mean(T.square(mom_gen - mom_real))
 
-# test error
-output_before_softmax = LL.get_output(layers[-1], x_lab, deterministic=True)
-test_err = T.mean(T.neq(T.argmax(output_before_softmax,axis=1),labels))
+def build_model_blstm_face(max_frames_x, input_dim, output_dim, nb_units, noise_dim, test_cond=0):
+    if test_cond == 1:
+        input_seqs = Input(shape=(None, input_dim), dtype='float32', name='input_s')
+        input_seqs_rnd = Input(shape=(None, noise_dim), dtype='float32', name='input_s_rnd')
+    else:
+        input_seqs = Input(shape=(max_frames_x, input_dim), dtype='float32', name='input_s')
+        input_seqs_rnd = Input(shape=(max_frames_x, noise_dim), dtype='float32', name='input_s_rnd')
 
-# Theano functions for training and testing
-lr = T.scalar()
-disc_params = LL.get_all_params(layers, trainable=True)
-disc_param_updates = nn.adam_updates(disc_params, loss_lab + args.unlabeled_weight*loss_unl, lr=lr, mom1=0.5)
-disc_param_avg = [th.shared(np.cast[th.config.floatX](0.*p.get_value())) for p in disc_params]
-disc_avg_updates = [(a,a+0.0001*(p-a)) for p,a in zip(disc_params,disc_param_avg)]
-disc_avg_givens = [(p,a) for p,a in zip(disc_params,disc_param_avg)]
-gen_params = LL.get_all_params(gen_layers[-1], trainable=True)
-gen_param_updates = nn.adam_updates(gen_params, loss_gen, lr=lr, mom1=0.5)
-init_param = th.function(inputs=[x_lab], outputs=None, updates=init_updates)
-train_batch_disc = th.function(inputs=[x_lab,labels,x_unl,lr], outputs=[loss_lab, loss_unl, train_err], updates=disc_param_updates+disc_avg_updates)
-train_batch_gen = th.function(inputs=[x_unl,lr], outputs=[loss_gen], updates=gen_param_updates)
-test_batch = th.function(inputs=[x_lab,labels], outputs=test_err, givens=disc_avg_givens)
+    input_seqs_merged = concatenate([input_seqs, input_seqs_rnd])
+    # msk_inp = Masking(mask_value=0.0)(input_seqs)
+    layer_id = 0
+    outs = {}
+    if input_dim < 3:
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(LSTM(nb_units[layer_id],
+                                                                    dropout=0.0, recurrent_dropout=0.2,
+                                                                    return_sequences=True))(input_seqs_merged)
+    else:
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(LSTM(nb_units[layer_id],
+                                                                    dropout=0.2, recurrent_dropout=0.2,
+                                                                    return_sequences=True))(input_seqs_merged)
+    layer_id += 1
+    while layer_id < len(nb_units):
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(LSTM(nb_units[layer_id],
+                                                       dropout=0.2, recurrent_dropout=0.2,
+                                                       return_sequences=True))\
+            (outs['layer' + str(layer_id - 1) + '_out'])
+        layer_id += 1
+    outs_drp = Dropout(rate=0.2)(outs['layer' + str(layer_id - 1) + '_out'])
+    output = TimeDistributed(Dense(output_dim * 1,),
+                             batch_input_shape=(max_frames_x, nb_units[-1]),
+                             name='output')(outs_drp)
+    model = Model(inputs=[input_seqs, input_seqs_rnd], outputs=[output])
+    return model
 
-# load MNIST data
-mnist_dir = os.path.dirname(os.path.abspath(__file__))
-mnist_path = os.path.join(mnist_dir, 'mnist.npz')
-assert isinstance(mnist_path, str)
-data = np.load(mnist_path)
-trainx = np.concatenate([data['x_test']], axis=0).astype(th.config.floatX)
-trainx = trainx[0:8000]
-trainx_unl = trainx.copy()
-trainx_unl2 = trainx.copy()
-trainy = np.load(args.labels)
-trainy = trainy[0:8000]
-trainy_true = data['y_test'].astype(np.int32)[:8000]
-nr_batches_train = int(trainx.shape[0]/args.batch_size)
-testx = data['x_test'].astype(th.config.floatX)[8000:]
-testy = data['y_test'].astype(np.int32)[8000:]
-nr_batches_test = int(testx.shape[0]/args.batch_size)
 
-# select labeled data
-inds = data_rng.permutation(trainx.shape[0])
-np.save("perm.npy", inds)
-trainx = trainx[inds]
-trainy = trainy[inds]
-if args.balance:
-    txs = []
-    tys = []
-    used_inds = []
-    for j in range(10):
-        used_inds.append(inds[trainy_true==j][:args.count])
-        txs.append(trainx[trainy_true==j][:args.count])
-        tys.append(trainy[trainy_true==j][:args.count])
-    used_inds = np.concatenate(used_inds, axis=0)
-    np.save("used_inds_" + str(args.count) + ".npy", used_inds)
-    txs = np.concatenate(txs, axis=0)
-    tys = np.concatenate(tys, axis=0)
-else:
-    txs = trainx[0:args.count * 10]
-    tys = trainy[0:args.count * 10]
+def model_discrimnator(max_frames_x, input_dim, output_dim, output_dim_dis, nb_units):
+    input_seqs1 = Input(shape=(max_frames_x, input_dim), dtype='float32', name='input_s1')
+    input_seqs2 = Input(shape=(max_frames_x, output_dim), dtype='float32', name='input_s2')
 
-init_param(trainx[:500]) # data dependent initialization
+    input_seqs = concatenate([input_seqs1, input_seqs2])
+    layer_id = 0
+    outs = {}
+    rs = True
+    outs['layer' + str(layer_id) + '_out'] = Bidirectional(SimpleRNN(nb_units[layer_id], activation='relu',
+                                                       use_bias=True, recurrent_initializer='orthogonal',
+                                                       bias_initializer='zeros',
+                                                       dropout=0.2, recurrent_dropout=0.2,
+                                                       kernel_regularizer=None, recurrent_regularizer=None,
+                                                       bias_regularizer=None, activity_regularizer=None,
+                                                       kernel_constraint=None, recurrent_constraint=None,
+                                                       bias_constraint=None, return_sequences=rs))(input_seqs)
+    layer_id += 1
+    while layer_id < len(nb_units):
+        if len(nb_units) - layer_id == 1:
+            rs = False
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(SimpleRNN(nb_units[layer_id], activation='relu',
+                                                           use_bias=True, recurrent_initializer='orthogonal',
+                                                           bias_initializer='zeros', dropout=0.2,
+                                                           recurrent_dropout=0.2, kernel_regularizer=None,
+                                                           recurrent_regularizer=None, bias_regularizer=None,
+                                                           activity_regularizer=None, kernel_constraint=None,
+                                                           recurrent_constraint=None, bias_constraint=None,
+                                                           return_sequences=rs))\
+            (outs['layer' + str(layer_id - 1) + '_out'])
+        layer_id += 1
+    outs_drp = Dropout(rate=0.2)(outs['layer' + str(layer_id - 1) + '_out'])
+    # outs_drp_flat = Flatten()(outs_drp)
+    output = Dense(output_dim_dis, activation='softmax', name='output-dis')(outs_drp)
+    model = Model(inputs=[input_seqs1, input_seqs2], outputs=[output])
+    return model
 
-# //////////// perform training //////////////
-lr = 0.003
-for epoch in range(args.epochs):
-    begin = time.time()
 
-    # construct randomly permuted minibatches
-    trainx = []
-    trainy = []
-    for t in range(trainx_unl.shape[0]/txs.shape[0]):
-        inds = rng.permutation(txs.shape[0])
-        trainx.append(txs[inds])
-        trainy.append(tys[inds])
-    trainx = np.concatenate(trainx, axis=0)
-    trainy = np.concatenate(trainy, axis=0)
-    trainx_unl = trainx_unl[rng.permutation(trainx_unl.shape[0])]
-    trainx_unl2 = trainx_unl2[rng.permutation(trainx_unl2.shape[0])]
+def model_discrimnator_blstm(max_frames_x, input_dim, output_dim, output_dim_dis, nb_units):
+    input_seqs1 = Input(shape=(max_frames_x, input_dim), dtype='float32', name='input_s1')
+    input_seqs2 = Input(shape=(max_frames_x, output_dim), dtype='float32', name='input_s2')
 
-    # train
-    loss_lab = 0.
-    loss_unl = 0.
-    train_err = 0.
-    for t in range(nr_batches_train):
-        ll, lu, te = train_batch_disc(trainx[t*args.batch_size:(t+1)*args.batch_size],trainy[t*args.batch_size:(t+1)*args.batch_size],
-                                        trainx_unl[t*args.batch_size:(t+1)*args.batch_size],lr)
-        loss_lab += ll
-        loss_unl += lu
-        train_err += te
-        e = train_batch_gen(trainx_unl2[t*args.batch_size:(t+1)*args.batch_size],lr)
-    loss_lab /= nr_batches_train
-    loss_unl /= nr_batches_train
-    train_err /= nr_batches_train
+    input_seqs = concatenate([input_seqs1, input_seqs2])
+    layer_id = 0
+    outs = {}
+    rs = True
+    if len(nb_units) - layer_id == 1:
+        rs = False
+    if input_dim < 3:
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(LSTM(nb_units[layer_id],
+                                                               dropout=0.0, recurrent_dropout=0.2,
+                                                               return_sequences=rs))(input_seqs)
+    else:
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(LSTM(nb_units[layer_id],
+                                                                    dropout=0.2, recurrent_dropout=0.2,
+                                                                    return_sequences=rs))(input_seqs)
+    layer_id += 1
+    while layer_id < len(nb_units):
+        if len(nb_units) - layer_id == 1:
+            rs = False
+        outs['layer' + str(layer_id) + '_out'] = Bidirectional(LSTM(nb_units[layer_id],
+                                                               dropout=0.2, recurrent_dropout=0.2,
+                                                               return_sequences=rs))\
+            (outs['layer' + str(layer_id - 1) + '_out'])
+        layer_id += 1
+    outs_drp = Dropout(rate=0.2)(outs['layer' + str(layer_id - 1) + '_out'])
+    # outs_drp_flat = Flatten()(outs_drp)
+    output = Dense(output_dim_dis, activation='softmax', name='output-dis')(outs_drp)
+    model = Model(inputs=[input_seqs1, input_seqs2], outputs=[output])
+    return model
 
-    # test
-    test_err = 0.
-    for t in range(nr_batches_test):
-        test_err += test_batch(testx[t*args.batch_size:(t+1)*args.batch_size],testy[t*args.batch_size:(t+1)*args.batch_size])
-    test_err /= nr_batches_test
 
-    # report
-    print("Iteration %d, time = %ds, loss_lab = %.4f, loss_unl = %.4f, train err = %.4f, test err = %.4f" % (epoch, time.time()-begin, loss_lab, loss_unl, train_err, test_err))
-    sys.stdout.flush()
+def accuracy_sup(y_true, y_pred):
+
+    return T.mean(categorical_accuracy(y_true[(1-y_true[:, 0]).nonzero(), 1:], y_pred[(1-y_true[:, 0]).nonzero(), 1:]))
+
+
+def accuracy_unsup(y_true, y_pred):
+    return binary_accuracy(y_true[:, 0], y_pred[:, 0])
+
+
+def model_generator(max_frames_x, input_dim, output_dim, nb_units):
+    return build_model_irnn_face(max_frames_x, input_dim, output_dim, nb_units)
+
+
+def semi_sup_loss(y_true, y_pred):
+    return categorical_crossentropy(y_true, y_pred) * T.makeKeepDims(y_true, 1-y_true[:, 0], axis=-1) + \
+           categorical_crossentropy(T.stack([y_true[:, 0], T.sum(y_true[:, 1:], axis=1, keepdims=False)], axis=1),
+                                    T.stack([y_pred[:, 0], T.sum(y_pred[:, 1:], axis=1, keepdims=False)], axis=1))
+
+# loss_unl = -0.5*T.mean(l_unl) + 0.5*T.mean(T.nnet.softplus(nn.log_sum_exp(output_before_softmax_unl))) \
+#                               + 0.5*T.mean(T.nnet.softplus(nn.log_sum_exp(output_before_softmax_fake)))
+
+def build_model_gan(max_frames_x, input_dim, output_dim, output_dim_dis, nb_units, learning_r, optimizer, loss, optimizer_dis, network_cond, noise_dim):
+    # global generator, discriminator, batch_size, gan
+    if network_cond == 'IRNN':
+        generator = build_model_irnn_face(max_frames_x, input_dim, output_dim, nb_units)
+    elif network_cond == 'BLSTM':
+        generator = build_model_blstm_face(max_frames_x, input_dim, output_dim, nb_units, noise_dim)
+    if optimizer == 'SGD':
+        optimizer_fun = SGD(lr=learning_r, decay=learning_r*0.1, momentum=0.95)
+    elif optimizer == 'RMSprop':
+        optimizer_fun = RMSprop(lr=learning_r, rho=0.9, epsilon=1e-08)
+    elif optimizer == 'Adam':
+        optimizer_fun = Adam(lr=learning_r)
+    elif optimizer == 'Adadelta':
+        optimizer_fun = Adadelta(lr=learning_r)
+    generator.compile(loss='mse', optimizer=optimizer_fun)
+    if network_cond == 'IRNN':
+        discriminator = model_discrimnator(max_frames_x, input_dim, output_dim, nb_units)
+    elif network_cond == 'BLSTM':
+        discriminator = model_discrimnator_blstm(max_frames_x, input_dim, output_dim, output_dim_dis, nb_units)
+    if optimizer_dis == 'SGD':
+        optimizer_fun = SGD(lr=learning_r, decay=learning_r*0.1, momentum=0.95)
+    elif optimizer_dis == 'RMSprop':
+        optimizer_fun = RMSprop(lr=learning_r, rho=0.9, epsilon=1e-08)
+    elif optimizer_dis == 'Adam':
+        optimizer_fun = Adam(lr=learning_r)
+    elif optimizer_dis == 'Adadelta':
+        optimizer_fun = Adadelta(lr=learning_r)
+    from keras.losses import categorical_crossentropy, binary_crossentropy
+
+    discriminator.compile(loss=semi_sup_loss, metrics=[accuracy_sup, accuracy_unsup, 'accuracy'], optimizer=optimizer_fun)
+
+    discriminator.trainable = False  # Freeze discriminator weights
+    gan_inputs = generator.inputs
+    y = generator(gan_inputs)
+    gan_output = discriminator([gan_inputs[0], y])
+    gan = Model(inputs=gan_inputs, outputs=gan_output)
+    gan.compile(loss=semi_sup_loss, metrics=[accuracy_sup, accuracy_unsup, 'accuracy'], optimizer=optimizer_fun)
+    generator.compile(loss=cc_coef, metrics=['mse'], optimizer=optimizer_fun)
+    return gan, discriminator, generator
+
+
+
